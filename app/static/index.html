@@ -29,8 +29,16 @@
   .badge.failed { background:#ffebe9; color:var(--red); }
   .badge.committed { background:#dafbe1; color:var(--green); }
   .badge.rejected { background:#ffebe9; color:var(--red); }
+  .badge.withdrawn { background:#f3f4f6; color:var(--muted); }
   .badge.OK { background:#dafbe1; color:var(--green); }
   .badge.REVIEW { background:#fff8c5; color:var(--amber); }
+  button.mini { padding:3px 10px; font-size:12px; }
+  button.warn { background:#fff1e5; border-color:#e0a070; }
+  button.link { border:none; background:none; color:var(--blue); padding:3px 6px; font-size:12px; }
+  #modalMask { position:fixed; inset:0; background:rgba(0,0,0,.45); display:none; align-items:center; justify-content:center; z-index:20; }
+  #modalMask.show { display:flex; }
+  .modal { background:#fff; border-radius:10px; width:min(860px, 92vw); max-height:84vh; overflow:auto; padding:20px; }
+  .modal h3 { margin:0 0 12px; font-size:15px; }
   #toast { position:fixed; right:20px; bottom:20px; max-width:420px; display:grid; gap:8px; z-index:10; }
   .toast { padding:12px 16px; border-radius:8px; color:#fff; font-size:13px; box-shadow:0 4px 12px rgba(0,0,0,.15); }
   .toast.ok { background:var(--green); }
@@ -52,7 +60,8 @@
     <div>
       <h2>① 增量上传：累计读数 CSV</h2>
       <p class="hint">表头：<code>account,meter,read_at,reading_cum</code><br>
-        同表同时同值重传自动只计一次；异值整批拒收（HTTP 422）。</p>
+        每条数据行都记录逐条来源（同值重传同样留痕）；同表同时刻异值整批拒收（HTTP 422）。
+        仅当有效读数发生变化时现役结果才过期。</p>
       <div class="row">
         <input type="file" id="readingFile" accept=".csv,text/csv">
         <button class="primary" onclick="upload('reading')">上传读数</button>
@@ -107,17 +116,39 @@
   </section>
 
   <section class="card">
-    <h2>上传批次记录（含拒收审计）</h2>
+    <h2>上传批次记录（含拒收审计与撤回）</h2>
+    <p class="hint">读数批次可在网页撤回：撤回后该批来源停用；读数若仍有其他未撤回批次供数则继续参与计算，
+      仅失去最后有效来源的读数退出后续生成。原始读数、来源与历史代际下载始终保留可追溯。
+      旧库迁入的批次（无逐条来源）注明「不可撤回」，仍正常供数。</p>
     <div class="scroll">
       <table id="batchTable">
         <thead><tr>
-          <th>批次</th><th>类型</th><th>文件</th><th>状态</th><th>行数</th><th>时间 (UTC)</th><th>拒收原因</th>
+          <th>批次</th><th>类型</th><th>文件</th><th>状态</th><th>数据行</th>
+          <th>来源(有效/总)</th><th>可撤回</th><th>时间 (UTC)</th><th>拒收原因</th><th>操作</th>
         </tr></thead>
         <tbody></tbody>
       </table>
     </div>
   </section>
 </main>
+
+<div id="modalMask" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <h3 id="modalTitle">逐条来源</h3>
+    <div class="scroll">
+      <table id="sourceTable">
+        <thead><tr>
+          <th>来源ID</th><th>行号</th><th>账户</th><th>表号</th><th>时刻 (UTC)</th>
+          <th>累计读数</th><th>读数ID</th><th>来源状态</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="row" style="margin-top:14px; justify-content:flex-end">
+      <button onclick="closeModal()">关闭</button>
+    </div>
+  </div>
+</div>
 <div id="toast"></div>
 
 <script>
@@ -182,13 +213,27 @@ async function loadAll() {
       <td><a class="dl" href="/api/generations/${g.id}/download">下载 CSV</a></td>
     </tr>`).join('') || '<tr><td colspan="9" style="color:#656d76">尚无结果代际</td></tr>';
 
-  document.querySelector('#batchTable tbody').innerHTML = batches.map(b => `
+  document.querySelector('#batchTable tbody').innerHTML = batches.map(b => {
+    const isReading = b.batch_type === 'reading';
+    const src = isReading ? `${b.active_source_count ?? 0}/${b.source_count ?? 0}` : '—';
+    const withdrawable = isReading && b.withdrawable
+      ? (b.status === 'committed' ? '是' : '—')
+      : (isReading ? '否（旧库无逐条来源）' : '—');
+    const actions = isReading
+      ? `<button class="link" onclick="viewSources(${b.id})">查看来源</button>` +
+        (b.status === 'committed' && b.withdrawable
+          ? `<button class="mini warn" onclick="withdraw(${b.id})">撤回批次</button>`
+          : '')
+      : '<span style="color:#656d76;font-size:12px">整版替换</span>';
+    return `
     <tr>
       <td>${b.id}</td><td>${b.batch_type}</td><td>${esc(b.filename)}</td>
       <td><span class="badge ${b.status}">${b.status}</span></td>
-      <td>${b.row_count}</td><td>${esc(b.created_at)}</td>
-      <td>${esc(b.reject_reason ?? '')}</td>
-    </tr>`).join('') || '<tr><td colspan="7" style="color:#656d76">尚无上传批次</td></tr>';
+      <td>${b.row_count}</td><td>${src}</td><td>${withdrawable}</td>
+      <td>${esc(b.created_at)}</td>
+      <td>${esc(b.reject_reason ?? '')}</td><td>${actions}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="10" style="color:#656d76">尚无上传批次</td></tr>';
 
   const latest = gens[0];
   const rowsBody = document.querySelector('#rowsTable tbody');
@@ -208,6 +253,48 @@ async function loadAll() {
       <td>${esc(r.review_reason_detail ?? '')}</td>
       <td>${esc(r.source_reading_ids)}</td>
     </tr>`).join('');
+}
+
+async function withdraw(batchId) {
+  if (!confirm(`确认撤回批次 ${batchId}？\n该批逐条来源将停用；仍有其他未撤回批次供数的读数继续参与计算，仅失去最后来源的读数退出后续生成。`)) return;
+  try {
+    const resp = await fetch(`/api/batches/${batchId}/withdraw`, { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || ('HTTP ' + resp.status));
+    toast(data.message);
+  } catch (e) {
+    toast('撤回失败：' + e.message, false);
+  }
+  loadAll();
+}
+
+function closeModal() {
+  document.getElementById('modalMask').classList.remove('show');
+}
+
+async function viewSources(batchId) {
+  try {
+    const resp = await fetch(`/api/batches/${batchId}/sources`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || ('HTTP ' + resp.status));
+    document.getElementById('modalTitle').textContent =
+      `批次 ${batchId} 的逐条来源（共 ${data.sources.length} 条）`;
+    const body = document.querySelector('#sourceTable tbody');
+    if (!data.withdrawable) {
+      body.innerHTML = `<tr><td colspan="8" style="color:#656d76">${esc(data.message || '旧版批次，无逐条来源')}</td></tr>`;
+    } else {
+      body.innerHTML = data.sources.map(s => `
+        <tr>
+          <td>${s.id}</td><td>${s.row_no}</td><td>${esc(s.account)}</td>
+          <td>${esc(s.meter)}</td><td>${esc(s.read_at)}</td>
+          <td>${s.reading_cum}</td><td>${s.reading_id}</td>
+          <td><span class="badge ${s.active ? 'committed' : 'withdrawn'}">${s.active ? '有效' : '已撤回'}</span></td>
+        </tr>`).join('') || '<tr><td colspan="8" style="color:#656d76">无来源记录</td></tr>';
+    }
+    document.getElementById('modalMask').classList.add('show');
+  } catch (e) {
+    toast('查询来源失败：' + e.message, false);
+  }
 }
 loadAll();
 </script>

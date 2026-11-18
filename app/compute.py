@@ -63,10 +63,13 @@ def _load_replacements(conn: sqlite3.Connection) -> dict[str, dict]:
 
 
 def _load_readings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    # Only effective readings participate: a reading is effective while at
+    # least one non-withdrawn source attests it (readings.active = 1).
     return list(
         conn.execute(
             """SELECT id, account, meter, read_at, reading_cum
                  FROM readings
+                WHERE active = 1
              ORDER BY account, meter, read_at, id"""
         )
     )
@@ -187,7 +190,8 @@ def generate_generation(conn: sqlite3.Connection) -> dict:
         reading_batch_ids = [
             str(r["id"])
             for r in conn.execute(
-                "SELECT id FROM upload_batches WHERE batch_type='reading' AND status='committed' ORDER BY id"
+                "SELECT id FROM upload_batches "
+                "WHERE batch_type='reading' AND status='committed' ORDER BY id"
             )
         ]
         repl_row = conn.execute(

@@ -13,7 +13,15 @@ from pydantic import BaseModel
 
 from .compute import GenerationError, generate_generation, reason_label
 from .database import get_connection, init_db
-from .ingestion import BatchRejected, ingest_readings, ingest_replacements
+from .ingestion import (
+    BatchNotFound,
+    BatchNotWithdrawable,
+    BatchRejected,
+    ingest_readings,
+    ingest_replacements,
+    record_rejected_batch,
+    withdraw_reading_batch,
+)
 
 
 @asynccontextmanager
@@ -54,16 +62,31 @@ def index():
 @app.post("/api/uploads/readings", response_model=Message)
 def upload_readings(file: UploadFile = File(...)):
     text = _text_of(file)
+    filename = file.filename or "readings.csv"
     conn = get_connection()
     try:
         try:
-            detail = ingest_readings(conn, file.filename or "readings.csv", text)
+            detail = ingest_readings(conn, filename, text)
         except BatchRejected as exc:
+            # Single place that records the rejection audit row: the ingestion
+            # transaction has already rolled back, so nothing partial survives.
+            try:
+                record_rejected_batch(conn, "reading", filename, exc.reason)
+            except Exception:  # pragma: no cover - audit must never mask the 422
+                pass
             raise HTTPException(status_code=422, detail=exc.reason) from exc
-        return Message(ok=True,
-                       message=f"读数上传成功：新增 {detail['inserted']} 条，"
-                               f"同表同时同值重传跳过 {detail['duplicates_skipped']} 条",
-                       detail=detail)
+        return Message(
+            ok=True,
+            message=(
+                f"读数上传成功：逐条来源 {detail['sources_recorded']} 条，"
+                f"新增有效读数 {detail['inserted']} 条，"
+                f"同值重传（保留来源）{detail['duplicates_skipped']} 条，"
+                f"重新生效 {detail['reactivated']} 条；"
+                + ("现役结果已标过期" if detail["effective_changed"]
+                   else "有效读数未变化，现役结果保持有效")
+            ),
+            detail=detail,
+        )
     finally:
         conn.close()
 
@@ -71,15 +94,45 @@ def upload_readings(file: UploadFile = File(...)):
 @app.post("/api/uploads/replacements", response_model=Message)
 def upload_replacements(file: UploadFile = File(...)):
     text = _text_of(file)
+    filename = file.filename or "replacements.csv"
     conn = get_connection()
     try:
         try:
-            detail = ingest_replacements(conn, file.filename or "replacements.csv", text)
+            detail = ingest_replacements(conn, filename, text)
         except BatchRejected as exc:
+            try:
+                record_rejected_batch(conn, "replacement", filename, exc.reason)
+            except Exception:  # pragma: no cover
+                pass
             raise HTTPException(status_code=422, detail=exc.reason) from exc
         return Message(ok=True,
                        message=f"换表整版上传成功：载入 {detail['inserted']} 户，旧版换表数据已被替换",
                        detail=detail)
+    finally:
+        conn.close()
+
+
+@app.post("/api/batches/{batch_id}/withdraw", response_model=Message)
+def withdraw_batch(batch_id: int):
+    """Withdraw a committed readings batch (per-row sources required)."""
+    conn = get_connection()
+    try:
+        try:
+            detail = withdraw_reading_batch(conn, batch_id)
+        except BatchNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except BatchNotWithdrawable as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return Message(
+            ok=True,
+            message=(
+                f"批次 {batch_id} 已撤回：停用来源 {detail['sources_withdrawn']} 条，"
+                f"失去最后来源的读数 {detail['readings_deactivated']} 条；"
+                + ("现役结果已标过期" if detail["effective_changed"]
+                   else "有效读数未变化（仍有其他未撤回批次供数），现役结果保持有效")
+            ),
+            detail=detail,
+        )
     finally:
         conn.close()
 
@@ -154,12 +207,59 @@ def list_generations():
 def list_batches():
     conn = get_connection()
     try:
-        return {
-            "batches": [
-                dict(r) for r in conn.execute(
-                    "SELECT * FROM upload_batches ORDER BY id DESC")
-            ]
-        }
+        batches = [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM upload_batches ORDER BY id DESC")
+        ]
+        for b in batches:
+            if b["batch_type"] == "reading":
+                stats = conn.execute(
+                    """SELECT COUNT(*) AS total,
+                              SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) AS active_count
+                         FROM reading_sources WHERE batch_id=?""",
+                    (b["id"],),
+                ).fetchone()
+                b["source_count"] = stats["total"] or 0
+                b["active_source_count"] = stats["active_count"] or 0
+            else:
+                b["source_count"] = None
+                b["active_source_count"] = None
+        return {"batches": batches}
+    finally:
+        conn.close()
+
+
+@app.get("/api/batches/{batch_id}/sources")
+def batch_sources(batch_id: int):
+    """Per-row source ledger of one batch (includes withdrawn rows)."""
+    conn = get_connection()
+    try:
+        batch = conn.execute(
+            "SELECT * FROM upload_batches WHERE id=?", (batch_id,)
+        ).fetchone()
+        if batch is None:
+            raise HTTPException(status_code=404, detail=f"不存在批次 {batch_id}")
+        if batch["batch_type"] != "reading":
+            raise HTTPException(
+                status_code=409,
+                detail=f"批次 {batch_id} 是换表批次，无逐条读数来源记录")
+        if not batch["withdrawable"]:
+            return {
+                "batch_id": batch_id,
+                "withdrawable": False,
+                "sources": [],
+                "message": "旧版数据库批次，缺少逐条来源记录，不可撤回；其读数仍正常供数",
+            }
+        sources = [
+            dict(r) for r in conn.execute(
+                """SELECT id, reading_id, row_no, account, meter, read_at,
+                          reading_cum, active, created_at
+                     FROM reading_sources
+                    WHERE batch_id=? ORDER BY row_no, id""",
+                (batch_id,),
+            )
+        ]
+        return {"batch_id": batch_id, "withdrawable": True, "sources": sources}
     finally:
         conn.close()
 
